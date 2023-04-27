@@ -1,0 +1,527 @@
+---
+title: "FinalProject"
+author: "Kevin Li"
+date: '2023-04-22'
+output: html_document
+---
+```{r}
+setwd("C:/Users/kjl14009/Desktop/STAT5125/FinalProject")
+library(dplyr)
+library(tidyverse)
+library(stringr)
+library(lubridate)
+library(purrr)
+library(yardstick)
+library(kknn)
+library(ranger)
+library(maps)
+library(usdata)
+library(glmnet)
+library(tidymodels)
+```
+## I will be using a subset of some data I collected in the UConn Forest in the summer of 2022 
+## OBJECTIVES:
+## Using data I collected in tandem with model simulated data from a process-based ecohydrological model (EcH2O-iso) 
+## Modelling task: Build a (simplified) model of plant hydraulics, and calibrate using the observed data I collected 
+## GLUE model is modified for R 
+## Plot objective functions, access model performance
+## RESEARCH QUESTION:
+## I want to investigate water-use characteristics of Eastern Hemlock in the UConn Forest, specifically:
+###Does Hemlock size vary with its microtopography?
+###What depths might Hemlock draw water from?###
+
+<!-- Write your own relevant custom function -->
+<!-- Present a relevant map graphic -->
+<!-- Make a github repository for your project (share the link with me) -->
+<!-- Scrape your data from online. -->
+<!-- Include more than one form of uncertainty quantification from the bulletted list. -->
+```{r}
+##Format and tidy tree isotope data
+##daily median isotopes values
+
+#read in raw data from coring 
+hemcores <- read.csv('hemcores.csv')
+
+##Generate dates based on model results (match dates from model output)
+dates <- as.data.frame(seq(as.Date("2020/10/1"), as.Date("2022/12/31"), "days"))
+colnames(dates) = 'Date'  
+dates$Timestep <- 1:nrow(dates) 
+
+##clean raw data and join w/ dates to match timesteps
+hemcores <- hemcores %>% mutate(Date = mdy(Date))
+colnames(hemcores)[1] = 'Genus'  
+hemcores_list <- (split(hemcores,hemcores$Genus)) 
+list2env(hemcores_list,envir=.GlobalEnv)
+
+hHEM <- HEM %>% 
+  group_by(Date) %>%
+  summarize(median = median(X18O))
+hOAK <- OAK %>% 
+  group_by(Date) %>%
+  summarize(median = median(X18O))
+hPIN <- PIN %>% 
+  group_by(Date) %>%
+  summarize(median = median(X18O))
+
+Observed_Xylem_18O <- hHEM %>%
+  left_join(hOAK, by = 'Date') %>%
+  left_join(hPIN, by = 'Date') %>% 
+  rename(HEM = 2, OAK = 3, PIN = 4) %>% 
+  left_join(dates, by = 'Date') %>% 
+  # replace(is.na(.), -999) %>%
+  relocate(Timestep) %>% head() %>% select(-2) 
+
+Observed_Xylem_18O_long <- tidyr::gather(Observed_Xylem_18O, key = "variable", value = "value", -Timestep)
+ggplot(Observed_Xylem_18O_long, aes(x = Timestep, y = value, color = variable)) +
+  geom_point() + ylab("O18 (per mil)") + labs(color = "Species (Genus)")+ 
+           ggtitle("Xylem water isotopes of study site")+
+    theme_bw()
+
+##interesting... our Hemlock isotope values are more positive throughout the sampling period, indicating more enrichment. In other words, our Hemlock are using more enriched (recent rainfall water). Could it be that they are primarily drawing from the shallow soil layer? 
+
+##we will only be using data from the Hemlock in this investigation##
+```
+```{r}
+##SAPFLUX-processed data from sensors deployed in the UConn Forest
+
+#Format and tidy transpiration data (daily averages)
+AllData_subset <- read.csv('AllData_subset_032223.csv') #Cleaned via MATLAB
+alldata <- AllData_subset %>% 
+  select(Datetime, TreeID, Falladj) %>%
+  relocate(TreeID, Datetime, Falladj) %>% 
+  dplyr::rename(flow4cm = Falladj)
+  #glimpse()
+alldata$Datetime <-  as.POSIXct(as.character(factor(alldata$Datetime)), format = "%m/%d/%Y %H:%M", tx = "EST")
+
+##adjust data (some of it is corrupted)
+is.na(alldata$flow4cm) <- with(alldata, flow4cm < -1000 | flow4cm > 25000)
+
+options(digits=6)
+
+##separate ID by delimiter
+alldata <- separate(alldata, col = TreeID, into = c('x', 'Site','Genus','Letter','y'), sep = "_") 
+alldata$fullname = paste(alldata$Site, alldata$Genus, alldata$Letter, sep="_")
+alldata$sname = paste(alldata$Site, alldata$Genus, sep="_")
+  alldata <- subset(alldata, select = -c(x,y,Site,Genus,Letter)) 
+
+data_list <- split(alldata, alldata$fullname) 
+  data_list <- lapply(data_list, function(x) x[!(names(x) %in% c("fullname", "sname"))])
+  
+###Percent sap area by genus (calculated separately)
+psap <- read.csv("C:/Users/kjl14009/Desktop/STAT5125/FinalProject/Percent_Sapwood_Genus.csv")
+  psap <- psap[2:3]
+
+##Generate dates based on model results (match dates from model output)
+dates <- as.data.frame(seq(as.Date("2020/10/1"), as.Date("2022/12/31"), "days"))
+  colnames(dates) = 'Datetime'  
+  dates$Timestep <- 1:nrow(dates) 
+
+###HEM_H
+HEM_H <- data_list[grep('HEM_H', names(data_list))]
+HEM_H <- reduce(HEM_H, left_join, by = 'Datetime')
+HEM_H[is.na(HEM_H)] <- 0
+HEM_H <- HEM_H %>% mutate(RowSum=rowSums(.[setdiff(names(.),"Datetime")])) 
+HEM_H$flow4cmadj <- HEM_H$RowSum/(0.23)
+
+#convert to mm/day (220 based on crown area estimated via GIS)
+HEM_H$Tadj <- HEM_H$flow4cmadj * 24/(1000*220)  
+HEM_H$Datetime <-  as.POSIXct(as.character(factor(HEM_H$Datetime)), format = "%Y-%m-%d", tx = "EST")
+HEM_H <- aggregate(Tadj ~ Datetime, HEM_H, mean)
+HEM_H <- left_join(dates, HEM_H, by = "Datetime")
+is.na(HEM_H$Tadj) <- with(HEM_H, Tadj < -4 | Tadj > 5)
+HEM_H <- HEM_H %>% 
+  dplyr::rename('Transpiration'='Tadj')
+
+##observed transpiration data
+Observed_T <- HEM_H %>% replace(is.na(.), -999) %>% select(-1)
+Observed_T[Observed_T<0] <- NA
+Observed_T <- na.omit(Observed_T)
+```
+```{r}
+##Calculate daily VWC from soil moisture probe
+Hem_probe <- read.csv('ProbeC_0_012723.csv')
+
+##empty dates
+dates <- as.data.frame(seq(as.Date("2020/10/1"), as.Date("2022/12/31"), "days"))
+colnames(dates) = 'Datetime'  
+
+###HEM
+Hem_probe <- Hem_probe[c(2:5)]
+Hem_probe <- Hem_probe %>% 
+  dplyr::rename("Datetime" = "Date.Time..GMT.04.00")
+
+##Convert Datetime format
+Hem_probe$Datetime <- as.POSIXct(as.character(factor(Hem_probe$Datetime)), format = "%m/%d/%Y %H:%M", tx = "EST")
+Hem_probe$Datetime  <-  as.POSIXct(as.character(factor(Hem_probe$Datetime )), format = "%Y-%m-%d", tx = "EST")
+
+###agg daily means
+Hem_probe <- Hem_probe %>% mutate(Time = ymd(Datetime))
+cut(Hem_probe$Time, breaks="1 day")
+daily_mean <- aggregate(Hem_probe[c("d30","d20","d10")], 
+                        list(Datetime=cut(Hem_probe$Time, breaks="1 day")),
+                        mean)
+
+#convert back to datetime for left_join
+daily_mean$Datetime  <-  as.POSIXct(as.character(factor(daily_mean$Datetime )), format = "%Y-%m-%d", tx = "EST")
+HemSite <- left_join(dates,daily_mean, by = 'Datetime')
+# HemSite <- HemSite %>% replace(is.na(.), -999)
+VWC <- na.omit(HemSite)
+```
+
+```{r}
+###lets take a look at some other interesting aspects of observed data I collected...
+##NOTE: some of this data is not used in the model, but it tells us a lot about our study site and what to expect 
+main48 <- map_data("state")
+##study site location map
+storrs_dat <- data.frame(long = -72.2495, lat = 41.8084, town = "Storrs, UConn Forest")
+plot1 <- ggplot() + 
+  geom_polygon(data = main48, aes(x=long, y=lat, group = group),
+               color="black", fill = "blue")
+
+plot2 <- plot1 + geom_label(data = storrs_dat, aes(y = lat,
+                                                   x = long,
+                                                   label = town))
+plot2 + coord_cartesian(xlim = c(-75, -70), ylim = c(40, 43))
+
+
+#soil moisture content from the site where trees are located
+VWC_long <- tidyr::gather(VWC, key = "variable", value = "value", -Datetime)
+ggplot(VWC_long, aes(x = Datetime, y = value, color = variable)) +
+  geom_line() + ylab("m3m3 water content") + labs(color = "Depth (cm)")+ 
+           ggtitle("Soil Volumetric Water content (m3m3")+
+    theme_bw()
+#note the more pronounced changes in the shallow soil layers, this is the first layer to refill during precip events and the first to 'dry up'. It is likely our hemlock trees will draw primarily from the shallow soil depths, however if the rooting distribution shows, it is possible they are drawing water from deeper layers where the water is more stable
+
+#transpiration data from hemlock trees
+ggplot(Observed_T, aes(Timestep, Transpiration)) +
+           geom_line(na.rm=TRUE, color = 'green')+ 
+           ggtitle("Eastern Hemlock Transpiration UConn Forest (2022)") +
+           xlab("Timestep") + ylab("Total T (mm/day)")+
+    theme_bw()
+#in late June-July period which this data spans, tree transpiration is more pronounced, this is a result of increased transpiration during this time period due to more precipitation and higher solar radiation
+
+##lets take a look at some of our Hemlock tree characteristics
+Tree_Characteristics = read.csv("C:/Users/kjl14009/Desktop/STAT5125/FinalProject/HemlockTreeCharacteristics.csv")
+Tree_Characteristics <- subset(Tree_Characteristics, select = -c(Hemlock.ID,Circumference..ft., Circumference..cm.,Lat.Lon))
+#this tree data is pulled from https://www.hydroshare.org/resource/48594c7eba41451f91776a296f6464f5/ 
+#it is part of a large dataset I collected over the course of 2021. A-DD are the trees I sampled for water isotope data
+DBH = data.frame(Tree_Characteristics$Diameter..cm.)
+#Compute the empirical cumulative distribution function
+ecdf_values <- ecdf(DBH$Tree_Characteristics.Diameter..cm.)
+range <- seq(min(DBH$Tree_Characteristics.Diameter..cm.), max(DBH$Tree_Characteristics.Diameter..cm.), length.out = 30)
+cdf_values <- ecdf_values(range)
+DBH_cdf <- data.frame(x = range, cdf = cdf_values)
+
+#CDF for tree diameters
+ggplot(DBH_cdf, aes(x, cdf)) +
+  geom_line() +
+  labs(x = "Values", y = "CDF", title = "CDF Tree Diameters")
+##looks like a good distribution of tree sizes sampled
+
+##lets see if the size of my trees are somehow related with the distance from stream or microtopography (elevation) that would better explain some potential trends we might see in our RWU model later on.
+#for example, higher elevation trees will likely have less access to shallow soil moisture as water moves downhill 
+#trees that are closer to the stream have access to more readily available source of water instead of relying on a rapidly-depleted soil layer, potentially a competitive advantage (summer is hot = more evaporation, less soil moisture)
+
+##we have a lot of options for statistical models, however our dataset is small and noisy, lets try some: 
+
+##create a training-test split, lets do 80/20
+set.seed(101)
+dsplit <- initial_split(Tree_Characteristics, prop = 0.8)
+dsplit %>% class()
+dtrain <- dsplit %>% training()
+dtest <- dsplit %>% testing()
+
+#tree distance from stream and tree diameter
+Tree_Characteristics1 <- linear_reg() %>% 
+  set_mode("regression") %>%
+  set_engine("lm")
+tree_workflow <- workflow() %>%
+  add_model(Tree_Characteristics1) %>%
+  add_formula(Diameter..cm.~ Distance.from.Stream..m.)
+
+tree_fit <- tree_workflow %>% fit(dtrain)
+tree_fit %>% tidy()
+
+#tree elevation and tree diameter
+Tree_Characteristics2 <- linear_reg() %>% 
+  set_mode("regression") %>%
+  set_engine("lm")
+tree_workflow2 <- workflow() %>%
+  add_model(Tree_Characteristics2) %>%
+  add_formula(Diameter..cm.~Ground.Elev..m.)
+
+tree_fit2 <- tree_workflow2 %>% fit(dtrain)
+tree_fit2 %>% tidy()
+
+##LASSO
+tree_parsnip_lasso <- linear_reg(penalty = 0.01) %>% 
+  set_engine("glmnet") %>%
+  set_mode("regression") %>%
+step_normalize(all_predictors())
+
+tree_workflow3 <- workflow() %>%
+  add_model(tree_parsnip_lasso) %>%
+  add_formula(Diameter..cm. ~ .)
+
+tree_fit3 <- tree_workflow_3 %>% fit(dtrain)
+tree_fit3 %>% tidy() %>% arrange(estimate)
+
+##Random Forest
+tree_parsnip_rf <- rand_forest() %>% 
+  set_mode("regression") %>%
+  set_engine("ranger")
+
+tree_workflow4 <- workflow() %>%
+  add_model(tree_parsnip_rf) %>%
+  add_formula(Diameter..cm. ~ .)
+
+tree_fit4 <- tree_workflow4 %>% fit(dtrain)
+tree_fit4 %>% extract_fit_engine()
+
+##knn
+tree_parsnip_knn <- nearest_neighbor() %>% 
+  set_mode("regression") %>%
+  set_engine("kknn", neighbors = 3)
+
+tree_workflow5 <- workflow() %>%
+  add_model(tree_parsnip_knn) %>%
+  add_formula(Diameter..cm. ~ .)
+
+tree_fit5 <- tree_workflow5 %>% fit(dtrain)
+tree_fit5 %>% extract_fit_engine() %>% summary()
+
+#validate using held-out test set
+predictions_tree <- tree_fit %>% predict(dtest)
+predictions_tree2 <- tree_fit2 %>% predict(dtest)
+predictions_tree3 <- tree_fit3 %>% predict(dtest)
+predictions_tree4 <- tree_fit4 %>% predict(dtest)
+predictions_tree5 <- tree_fit5 %>% predict(dtest)
+
+predictions_all <- bind_cols(
+  predictions_tree,
+  predictions_tree2,
+  predictions_tree3,
+  predictions_tree4,
+  predictions_tree5,
+  dtest %>% select(Diameter..cm.),
+)
+
+predictions_longer <- predictions_all %>% pivot_longer(starts_with(".pred..."),
+                                                           names_prefix = ".pred...",
+                                                           values_to = "prediction",
+                                                           names_to = "model") %>% rename(truth = Diameter..cm.)
+  
+predictions_longer %>% ggplot(aes(x = truth, 
+                                      y = prediction)) +
+  geom_point(alpha = 0.2) +
+  facet_wrap(~model, nrow = 2) +
+  geom_abline(slope = 1, linetype = "dotted", color = "blue") +
+  coord_obs_pred() 
+
+##hmm... no clear relationship, lets look at the r-squared
+#compute objective function
+metrics <- metric_set(rsq)
+
+tree_results_1 <- predictions_longer %>% filter(model == 1) %>%
+  metrics(truth = truth, estimate = prediction)
+tree_results_2 <- predictions_longer %>% filter(model == 2) %>%
+  metrics(truth = truth, estimate = prediction)
+tree_results_3 <- predictions_longer %>% filter(model == 3) %>%
+  metrics(truth = truth, estimate = prediction)
+tree_results_4 <- predictions_longer %>% filter(model == 4) %>%
+  metrics(truth = truth, estimate = prediction)
+tree_results_5 <- predictions_longer %>% filter(model == 5) %>%
+  metrics(truth = truth, estimate = prediction)
+
+tree_results <- bind_rows(tree_results_1,
+                         tree_results_2,
+                         tree_results_3,
+                         tree_results_4,
+                         tree_results_5,
+                         .id = "model")
+tree_results %>% head()
+
+tree_results %>% ggplot(aes(y = model, x = .estimate, fill = model)) + 
+  geom_col() +
+  facet_wrap(~.metric, scales = "free_x")
+
+###surprisingly, no matter what model I use, theres seems to be NO relationship between tree diameter and microtopography!
+#perhaps its only at this particular site, the microtopography does not matter to tree growth/water-use...
+
+```
+
+```{r}
+####lets test out the plant hydraulics model
+###OBJECTIVE: find best parameter sets by calibrating model to observed data
+###read in simulated data 
+## 
+Soils = read.csv("C:/Users/kjl14009/Desktop/STAT5125/FinalProject/Soils_Isotopes.csv")
+T = read.csv("C:/Users/kjl14009/Desktop/STAT5125/FinalProject/Transpiration.csv")
+#read in observed data
+#observed xylem data (more data, but I collected in a different year)
+Obs18O <- read.csv("C:/Users/kjl14009/Desktop/STAT5125/FinalProject/hemcores_fenton.csv") 
+Obs18O <- Obs18O %>% rename('x' = 'HEM')
+
+#Randomly sample parameter (Kroot and TreeV) values from a uniform distribution
+nsims = 10000
+
+#Create two vectors of possible Kroot (0.1 - 15) and TreeV (1 - 150) values
+Kroot_Vals = runif(nsims,0.1,0.25) #single parameter describing root water uptake (the right value is probably between -1 and 1)
+TreeV_Vals = runif(nsims,1,70) #mm of water equivalent between 0, 100
+
+#2. Set model constants
+d1 = 10
+d2 = 10
+d3 = 10
+d = d1 + d2 + d3
+
+GLUE <- data.frame(matrix(ncol = 4, nrow = 10000))
+x <- c("Kroot", "TreeV", "RMSE","Pbias")
+colnames(GLUE) <- x
+
+counter = 1
+
+for (i in 1:10000){
+
+Kroot = Kroot_Vals[i]
+TreeV = TreeV_Vals[i]
+    
+#Compute the root distribution across the three soil layers based on Kroot parameter(RWU)
+frac1 = (1 - exp(-Kroot*d1))/(1-exp(-Kroot*d))
+frac2 = (exp(-Kroot*d1) - exp(-Kroot*(d1+d2)))/(1-exp(-Kroot*d))
+frac3 = 1 - (frac1 + frac2)
+  
+#Compute the isotopic (18O) composition of tree-stored water with parameters Kroot and TreeV
+#Initialize vectors for RWU_18O and Tree_18O
+
+RWU_18O = vector(length = nrow(T))
+Tree_18O = vector(length = nrow(T))
+Tree_18O[1] = -10
+  
+#Build a for loop time step through the record
+for (t in 2:nrow(T)){
+  
+#Compute the isotopic composition of root water uptake at time step t
+RWU_18O[t] = (frac1*Soils$L1[t] + frac2*Soils$L2[t] + frac3*Soils$L3[t])
+    
+#Compute the isotopic composition of tree-stored water at time step t
+###we draw upon two assumptions:
+#TreeV doesn't change (transpiration = RWU)
+#the tree is a well-mixed reservoir (so that the isotopic composition of transpiration at t is that of the tree at t-1)
+Tree_18O[t] = (Tree_18O[t-1]*TreeV + T$Transpiration[t]*RWU_18O[t] - T$Transpiration[t]*Tree_18O[t-1])/TreeV
+}
+
+#compute residuals
+Obs = Obs18O
+
+  Tree_18O = data.frame(T$Timestep,Tree_18O)
+  colnames(Tree_18O) = c("Timestep","Simulated_18O")
+  
+  AllData = merge(Tree_18O,Obs, by="Timestep")
+  AllData$Res = AllData$Simulated_18O - AllData$x
+  
+  GLUE$Kroot[counter] = Kroot_Vals[i]
+  GLUE$TreeV[counter] = TreeV_Vals[i]
+  GLUE$RMSE[counter] = sqrt(mean(AllData$Res^2))
+  GLUE$Pbias[counter] =  100*sum(AllData$Res)/sum(abs(AllData$Simulated_18O))
+
+counter = counter + 1
+# print(counter)
+}
+
+#fit lm, sensitivity analysis #simple function
+create_lm <- function(x, y, z) {
+  model <- lm(x ~ y + z)
+  return(model)
+}
+
+RMSE_lm <- create_lm(x = GLUE$RMSE, y = GLUE$Kroot, z = GLUE$TreeV)
+summary(RMSE_lm)
+##Rsq = 0.959 
+##Kroot parameter is a significant predictor of our objective functions
+
+
+#Plot of isotopic composition of calculated RWU,  tree stored water, and soil layer 1
+SoilL1 <- Soils[1:2]
+RWU_18O <- as.data.frame(RWU_18O)
+RWU_18O$Timestep <- 1:nrow(RWU_18O)
+RWU_18O <- RWU_18O[, c("Timestep", names(RWU_18O)[names(RWU_18O) != "Timestep"])]
+
+combined <- RWU_18O %>%
+  left_join(Tree_18O, by = 'Timestep') %>%
+  left_join(SoilL1, by = 'Timestep') 
+
+#Reshape the data into a long format
+combined_long <- tidyr::pivot_longer(combined, cols = -Timestep, names_to = "line", values_to = "y")
+# Plot the lines using ggplot2
+ggplot(combined_long, aes(x = Timestep, y = y, color = line)) +
+  geom_line() +
+  labs(x = "Timestep", 
+       y = "18O", 
+       color = "Line") +
+  ggtitle("UConn Forest Isotopes")+
+    theme_bw()+theme(
+    legend.position = "bottom")
+
+##our RWU values seem to match up nicely, the model works!
+```
+```{r}
+#define RMSE < 0.45 as 'acceptable'
+#new dataset of calibrated parameters where RMSE < 0.45 
+#Kroot and TreeV histograms for all values and calibrated values 
+GLUE_rmse <- GLUE %>% filter(RMSE < 0.45)
+par(mfrow = c(2,2))
+r1 <- hist(GLUE$Kroot)
+r2 <- hist(GLUE$TreeV)
+r3 <- hist(GLUE_rmse$Kroot)
+r4 <- hist(GLUE_rmse$TreeV)
+
+#pbias < 0.1 
+GLUE_pbias <- GLUE %>% filter(abs(Pbias) < 0.1)
+par(mfrow = c(2,2))
+r1 <- hist(GLUE$Kroot)
+r2 <- hist(GLUE$TreeV)
+p1 <- hist(GLUE_pbias$Kroot)
+p2 <- hist(GLUE_pbias$TreeV) 
+
+#RMSE is better for uncertainty quantification
+#try Kroot = 0.1, TreeV = 70 for our RMSE calibrated values
+```
+```{r}
+##try RMSE calibrated values
+##lets try....
+Kroot_rmse = .1
+TreeV_rmse = 70
+
+frac1 = (1 - exp(-Kroot_rmse*d1))/(1-exp(-Kroot_rmse*d))
+frac2 = (exp(-Kroot_rmse*d1) - exp(-Kroot_rmse*(d1+d2)))/(1-exp(-Kroot_rmse*d))
+frac3 = 1 - (frac1 + frac2)
+
+#isotopic (18O) composition of tree-stored water with parameters Kroot and TreeV
+RWU_18O = vector(length = nrow(T))
+Tree_18O = vector(length = nrow(T))
+Tree_18O[1] = -10
+
+for (t in 2:nrow(T))
+{
+  RWU_18O[t] = (frac1*Soils$L1[t] + frac2*Soils$L2[t] + frac3*Soils$L3[t])
+  Tree_18O[t] = (Tree_18O[t-1]*TreeV_rmse + T$Transpiration[t]*RWU_18O[t] - T$Transpiration[t]*Tree_18O[t-1])/TreeV_rmse
+}
+
+Tree_18O_rmse = data.frame(T$TimeStep,Tree_18O)
+colnames(Tree_18O_rmse) = c("Timestep","Simulated_18O")
+
+ggplot() +
+  geom_line(data=AllData, aes(x=Timestep,y=x,colour="Observed"),size=2)+
+  geom_line(data=Tree_18O_rmse, aes(x=Timestep,y=Simulated_18O,colour= "RMSE < 0.45"),size=1)+
+  labs(x = "Timestep", 
+       y = "18O", 
+       color = "Line") +
+  ggtitle("RMSE < .45, Kroot = .1, TreeV = 67")+
+    theme_bw()
+###this looks a lot better!Uncertainty has been reduced a good amount
+##our hemlock tree have very SHALLOW rooting distribution! It is likely they store more water internally (TreeV) which acts as a buffer for water-stress. This allows them to draw primarily from shallow soil layers throughout the year. This also makes sense why they do not seem to rely on the stream water and do not care about micro-topographic position
+##note: I temper my conclusions because this is a very simple model!
+```
+
+
